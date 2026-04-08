@@ -1,656 +1,262 @@
+import os
 import logging
-import random
-import asyncio
+import sqlite3
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from config import *
-from database import Database
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# Настройка
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-db = Database()
+# Токен из переменных окружения Render
+TOKEN = os.environ.get('BOT_TOKEN', '7600712318:AAFjjLpGJk4NcGk5ZqW2rX8vY7tU3sP1oM9')
 
-# ============ КЛАВИАТУРЫ ============
+# Данные бизнесов
+BUSINESSES = {
+    1: {"name": "🏪 Ларек", "income": 50, "upgrade_cost": 500},
+    2: {"name": "🏬 Магазин", "income": 150, "upgrade_cost": 2000},
+    3: {"name": "🏢 Супермаркет", "income": 400, "upgrade_cost": 8000},
+    4: {"name": "🏙️ Торговый центр", "income": 1000, "upgrade_cost": 30000},
+    5: {"name": "🌍 Корпорация", "income": 3000, "upgrade_cost": None}
+}
+
+def init_db():
+    conn = sqlite3.connect('business.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (user_id INTEGER PRIMARY KEY,
+                  balance INTEGER DEFAULT 1000,
+                  business_level INTEGER DEFAULT 1,
+                  last_collect TIMESTAMP,
+                  total_earned INTEGER DEFAULT 0,
+                  manager BOOLEAN DEFAULT FALSE,
+                  advertising BOOLEAN DEFAULT FALSE)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS daily_tasks
+                 (user_id INTEGER, task_date DATE, task_completed BOOLEAN DEFAULT FALSE)''')
+    conn.commit()
+    conn.close()
+
+def get_user(user_id):
+    conn = sqlite3.connect('business.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    user = c.fetchone()
+    conn.close()
+    return user
+
+def register_user(user_id):
+    conn = sqlite3.connect('business.db')
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, last_collect) VALUES (?, ?)",
+              (user_id, datetime.now()))
+    conn.commit()
+    conn.close()
+
+def update_balance(user_id, amount):
+    conn = sqlite3.connect('business.db')
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?",
+              (amount, max(amount, 0), user_id))
+    conn.commit()
+    conn.close()
+
+def upgrade_business(user_id):
+    conn = sqlite3.connect('business.db')
+    c = conn.cursor()
+    c.execute("UPDATE users SET business_level = business_level + 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def update_last_collect(user_id):
+    conn = sqlite3.connect('business.db')
+    c = conn.cursor()
+    c.execute("UPDATE users SET last_collect = ? WHERE user_id = ?", (datetime.now(), user_id))
+    conn.commit()
+    conn.close()
+
+def calculate_income(user):
+    level = user[2]
+    base_income = BUSINESSES[level]["income"]
+    multiplier = 1.0
+    if user[5]:
+        multiplier += 0.2
+    if user[6]:
+        multiplier += 0.1
+    return int(base_income * multiplier)
+
 def get_main_keyboard():
     keyboard = [
         [InlineKeyboardButton("💰 Баланс", callback_data="balance"),
-         InlineKeyboardButton("📊 Профиль", callback_data="profile")],
-        [InlineKeyboardButton("🎰 Казино", callback_data="casino"),
-         InlineKeyboardButton("🏎️ Гонка", callback_data="race")],
-        [InlineKeyboardButton("🎁 Кейсы", callback_data="cases"),
-         InlineKeyboardButton("👑 VIP", callback_data="vip")],
-        [InlineKeyboardButton("🏪 Бизнес", callback_data="business"),
-         InlineKeyboardButton("📈 Топы", callback_data="tops")],
-        [InlineKeyboardButton("🚗 Машины", callback_data="cars"),
-         InlineKeyboardButton("📋 Репорт", callback_data="report")]
+         InlineKeyboardButton("🏪 Бизнес", callback_data="business")],
+        [InlineKeyboardButton("💼 Заработать", callback_data="collect"),
+         InlineKeyboardButton("📈 Улучшения", callback_data="upgrades")],
+        [InlineKeyboardButton("📋 Задания", callback_data="tasks"),
+         InlineKeyboardButton("📊 Статистика", callback_data="stats")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# ============ ОСНОВНЫЕ КОМАНДЫ ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    username = update.effective_user.username or update.effective_user.first_name
+    register_user(user_id)
     
-    db.register_user(user_id, username)
-    user = db.get_user(user_id)
+    text = ("🏆 *Добро пожаловать в Деловой Магнат!* 🏆\n\n"
+            "Ты начинающий предприниматель с 1000 монет.\n"
+            "Каждые 15 минут собирай доход и развивай бизнес!\n\n"
+            "👇 *Используй кнопки ниже*")
     
-    # Добавляем стартовые кейсы
-    db.add_case(user_id, 1, 1)
-    
-    await update.message.reply_text(
-        f"🏦 *CRYPTO EMPIRE* 🏦\n\n"
-        f"👋 Привет, {user[3]}!\n"
-        f"📋 Твой ID: #{user[0]}\n"
-        f"💰 Баланс: {db.format_number(user[1])}£\n"
-        f"⭐ Рейтинг: {user[7]}\n\n"
-        f"🎁 Тебе выдан стартовый кейс!\n\n"
-        f"*Команды без /:*\n"
-        f"баланс, профиль, казино 1000, гонка, кейс 1",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
-    )
+    await update.message.reply_text(text, parse_mode='Markdown', 
+                                   reply_markup=get_main_keyboard())
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.lower()
-    user_id = update.effective_user.id
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     
-    if text in ["баланс", "деньги", "б"]:
-        user = db.get_user(user_id)
-        await update.message.reply_text(f"💰 *Баланс:* {db.format_number(user[1])}£", parse_mode="Markdown")
+    user_id = query.from_user.id
+    action = query.data
+    user = get_user(user_id)
     
-    elif text in ["профиль", "проф", "я"]:
-        user = db.get_user(user_id)
-        vip_bonus = VIP_PRICES.get(user[5], {"bonus": 1.0})["bonus"]
-        await update.message.reply_text(
-            f"👤 *ПРОФИЛЬ #{user[0]}*\n\n"
-            f"📝 Ник: {user[3]}\n"
-            f"💰 Баланс: {db.format_number(user[1])}£\n"
-            f"💎 CryptoCoin: {db.format_number(user[2])}\n"
-            f"⭐ Рейтинг: {user[7]}\n"
-            f"👑 VIP: {VIP_PRICES.get(user[5], {'name': 'Нет'})['name']}\n"
-            f"🚗 Машина: {CARS.get(user[8], {'name': 'Нет'})['name']}\n"
-            f"🏆 Кубки: {user[9]}\n"
-            f"🏁 Гонок: {user[10]}\n"
-            f"🎉 Побед: {user[11]}",
-            parse_mode="Markdown"
-        )
+    if action == "balance":
+        text = f"💰 *Ваш баланс:* {user[1]} монет\n📈 *Всего заработано:* {user[4]} монет"
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=get_main_keyboard())
     
-    elif text.startswith("казино "):
-        await casino_bet(update, context)
+    elif action == "business":
+        level = user[2]
+        business = BUSINESSES[level]
+        income = calculate_income(user)
+        
+        last_collect = datetime.fromisoformat(user[3]) if user[3] else datetime.now()
+        time_passed = (datetime.now() - last_collect).total_seconds()
+        time_left = max(0, 900 - time_passed)
+        minutes_left = int(time_left // 60)
+        seconds_left = int(time_left % 60)
+        
+        text = (f"🏪 *{business['name']}*\n"
+                f"📊 Уровень: {level}/5\n"
+                f"💵 Доход: {income} монет\n"
+                f"⏰ До сбора: {minutes_left} мин {seconds_left} сек")
+        
+        if level < 5:
+            text += f"\n⬆️ Апгрейд: {business['upgrade_cost']} монет"
+        
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=get_main_keyboard())
     
-    elif text == "гонка":
-        await race_start(update, context)
-    
-    elif text.startswith("кейс "):
-        await open_case_text(update, context)
-
-# ============ КАЗИНО ============
-async def casino_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = db.get_user(user_id)
-    
-    try:
-        bet_text = update.message.text.split()[1]
+    elif action == "collect":
+        last_collect = datetime.fromisoformat(user[3]) if user[3] else datetime.now()
+        time_passed = (datetime.now() - last_collect).total_seconds()
         
-        # Парсим сумму с K, M
-        bet_text_upper = bet_text.upper()
-        multiplier = 1
-        if bet_text_upper.endswith("K"):
-            multiplier = 1000
-            bet_text = bet_text[:-1]
-        elif bet_text_upper.endswith("M"):
-            multiplier = 1000000
-            bet_text = bet_text[:-1]
-        elif bet_text_upper.endswith("KK"):
-            multiplier = 1000000
-            bet_text = bet_text[:-2]
-        
-        bet = int(float(bet_text) * multiplier)
-        
-        if bet < 100:
-            await update.message.reply_text("❌ Минимальная ставка: 100£")
-            return
-        
-        if bet > user[1]:
-            await update.message.reply_text(f"❌ Не хватает! У вас {db.format_number(user[1])}£")
-            return
-        
-        # Выбор множителя
-        rand = random.random() * 100
-        cumulative = 0
-        selected = CASINO_MULTIPLIERS[0]
-        
-        for mult in CASINO_MULTIPLIERS:
-            cumulative += mult["chance"]
-            if rand <= cumulative:
-                selected = mult
-                break
-        
-        win_amount = int(bet * selected["x"])
-        
-        if win_amount > 0:
-            db.update_balance(user_id, win_amount - bet)
-            result = f"🎉 *{selected['name']}* x{selected['x']}\n💰 +{db.format_number(win_amount)}£"
+        if time_passed >= 900:
+            income = calculate_income(user)
+            update_balance(user_id, income)
+            update_last_collect(user_id)
+            text = f"✅ +{income} монет!\n💰 Новый баланс: {user[1] + income}"
         else:
-            db.update_balance(user_id, -bet)
-            result = f"💀 *{selected['name']}*\n💸 -{db.format_number(bet)}£"
+            minutes_left = int((900 - time_passed) // 60)
+            text = f"⏳ Еще {minutes_left} мин до сбора!"
         
-        new_user = db.get_user(user_id)
-        result += f"\n\n💰 Новый баланс: {db.format_number(new_user[1])}£"
-        
-        await update.message.reply_text(result, parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text("❌ Использование: казино 1000 или казино 1к")
-
-# ============ ГОНКИ ============
-race_queue = {}
-
-async def race_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = db.get_user(user_id)
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=get_main_keyboard())
     
-    if user[1] < RACE_ENTRY_FEE:
-        await update.message.reply_text(f"❌ Нужно {db.format_number(RACE_ENTRY_FEE)}£ для участия!")
-        return
-    
-    # Проверяем очередь
-    opponent = db.get_race_opponent(user_id)
-    
-    if opponent:
-        # Найден соперник - проводим гонку
-        db.remove_from_race_queue(opponent)
-        await race_fight(update, context, user_id, opponent)
-    else:
-        # Добавляем в очередь
-        db.add_to_race_queue(user_id)
-        await update.message.reply_text(
-            "🏁 *Вы в очереди на гонку!*\n"
-            "Ожидайте соперника...\n\n"
-            "Через 100 секунд вы сразитесь с ботом",
-            parse_mode="Markdown"
-        )
-        
-        # Таймер для гонки с ботом
-        await asyncio.sleep(100)
-        
-        # Проверяем, всё ещё в очереди?
-        still_in_queue = db.get_race_opponent(user_id)
-        if still_in_queue:
-            db.remove_from_race_queue(user_id)
-            await race_with_bot(update, context, user_id)
-
-async def race_fight(update: Update, context: ContextTypes.DEFAULT_TYPE, user1_id, user2_id):
-    user1 = db.get_user(user1_id)
-    user2 = db.get_user(user2_id)
-    
-    # Списываем взнос
-    db.update_balance(user1_id, -RACE_ENTRY_FEE)
-    db.update_balance(user2_id, -RACE_ENTRY_FEE)
-    
-    # Сила машин
-    car1_power = CARS.get(user1[8], {"power": 100})["power"]
-    car2_power = CARS.get(user2[8], {"power": 100})["power"]
-    
-    # Шанс победы зависит от силы машины
-    total_power = car1_power + car2_power
-    user1_chance = (car1_power / total_power) * 100
-    
-    rand = random.random() * 100
-    
-    if rand < user1_chance:
-        winner_id = user1_id
-        loser_id = user2_id
-        winner_power = car1_power
-    else:
-        winner_id = user2_id
-        loser_id = user1_id
-        winner_power = car2_power
-    
-    # Награда победителю
-    cups_earned = RACE_BASE_CUPS + int(winner_power / 100)
-    vip_bonus = VIP_PRICES.get(user1[5] if winner_id == user1_id else user2[5], {"bonus": 1.0})["bonus"]
-    cups_earned = int(cups_earned * vip_bonus)
-    
-    db.update_race_stats(winner_id, True, cups_earned)
-    db.update_race_stats(loser_id, False, 0)
-    
-    # Денежная награда
-    prize = RACE_ENTRY_FEE * 2 + random.randint(500, 2000)
-    db.update_balance(winner_id, prize)
-    
-    winner_user = db.get_user(winner_id)
-    loser_user = db.get_user(loser_id)
-    
-    # Отправляем результат
-    await context.bot.send_message(
-        winner_id,
-        f"🏆 *ПОБЕДА В ГОНКЕ!* 🏆\n\n"
-        f"Противник: {loser_user[3]}\n"
-        f"🎁 Награда: +{db.format_number(prize)}£\n"
-        f"🏆 Кубков: +{cups_earned}\n"
-        f"💰 Баланс: {db.format_number(winner_user[1])}£",
-        parse_mode="Markdown"
-    )
-    
-    await context.bot.send_message(
-        loser_id,
-        f"💨 *ПОРАЖЕНИЕ В ГОНКЕ!* 💨\n\n"
-        f"Победитель: {winner_user[3]}\n"
-        f"💰 Баланс: {db.format_number(loser_user[1])}£",
-        parse_mode="Markdown"
-    )
-    
-    # Даём гоночный кейс победителю
-    db.add_case(winner_id, 3, 1)
-
-async def race_with_bot(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id):
-    user = db.get_user(user_id)
-    
-    db.update_balance(user_id, -RACE_ENTRY_FEE)
-    
-    # Шанс победы над ботом - 50%
-    win = random.choice([True, False])
-    
-    if win:
-        cups_earned = RACE_BASE_CUPS
-        vip_bonus = VIP_PRICES.get(user[5], {"bonus": 1.0})["bonus"]
-        cups_earned = int(cups_earned * vip_bonus)
-        
-        prize = RACE_ENTRY_FEE * 2 + random.randint(200, 1000)
-        db.update_balance(user_id, prize)
-        db.update_race_stats(user_id, True, cups_earned)
-        
-        new_user = db.get_user(user_id)
-        
-        await context.bot.send_message(
-            user_id,
-            f"🏆 *ПОБЕДА НАД БОТОМ!* 🏆\n\n"
-            f"🎁 Награда: +{db.format_number(prize)}£\n"
-            f"🏆 Кубков: +{cups_earned}\n"
-            f"💰 Баланс: {db.format_number(new_user[1])}£",
-            parse_mode="Markdown"
-        )
-        
-        db.add_case(user_id, 3, 1)
-    else:
-        db.update_race_stats(user_id, False, 0)
-        new_user = db.get_user(user_id)
-        
-        await context.bot.send_message(
-            user_id,
-            f"💨 *ПОРАЖЕНИЕ ОТ БОТА!* 💨\n\n"
-            f"💰 Баланс: {db.format_number(new_user[1])}£",
-            parse_mode="Markdown"
-        )
-
-# ============ КЕЙСЫ ============
-async def open_case_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = db.get_user(user_id)
-    
-    try:
-        case_num = int(update.message.text.split()[1])
-        
-        if case_num not in CASES:
-            await update.message.reply_text("❌ Доступны кейсы: 1, 2, 3")
-            return
-        
-        case = CASES[case_num]
-        
-        if case["price"] > 0 and user[1] < case["price"]:
-            await update.message.reply_text(f"❌ Не хватает {db.format_number(case['price'])}£!")
-            return
-        
-        # Проверяем наличие кейса
-        user_cases = db.get_user_cases(user_id)
-        has_case = any(c[0] == case_num for c in user_cases)
-        
-        if case_num == 3 and not has_case:
-            await update.message.reply_text("❌ У вас нет гоночных кейсов!")
-            return
-        
-        if case["price"] > 0:
-            db.update_balance(user_id, -case["price"])
+    elif action == "upgrades":
+        level = user[2]
+        if level < 5:
+            text = ("📈 *Улучшения*\n\n"
+                   f"👔 Менеджер: {'✅' if user[5] else '❌'} (+20% дохода, 2000💰)\n"
+                   f"📢 Реклама: {'✅' if user[6] else '❌'} (+10% дохода, 1500💰)\n"
+                   f"⬆️ Апгрейд бизнеса: {BUSINESSES[level]['upgrade_cost']}💰")
+            
+            keyboard = []
+            if not user[5]:
+                keyboard.append([InlineKeyboardButton("👔 Нанять менеджера (2000💰)", callback_data="buy_manager")])
+            if not user[6]:
+                keyboard.append([InlineKeyboardButton("📢 Реклама (1500💰)", callback_data="buy_advertising")])
+            if level < 5:
+                keyboard.append([InlineKeyboardButton("⬆️ Апгрейд бизнеса", callback_data="upgrade_business")])
+            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back")])
+            
+            await query.edit_message_text(text, parse_mode='Markdown', 
+                                        reply_markup=InlineKeyboardMarkup(keyboard))
         else:
-            db.remove_case(user_id, case_num)
-        
-        # Награды
-        if case_num == 1:
-            rewards = [500, 1000, 2000, 5000]
-            reward = random.choice(rewards)
-            db.update_balance(user_id, reward)
-            await update.message.reply_text(
-                f"🎁 *{case['name']} кейс открыт!*\n"
-                f"💰 Получено: +{db.format_number(reward)}£",
-                parse_mode="Markdown"
-            )
-        elif case_num == 2:
-            rewards = [2000, 5000, 10000, 25000, 50000]
-            reward = random.choice(rewards)
-            db.update_balance(user_id, reward)
-            await update.message.reply_text(
-                f"🎁 *{case['name']} кейс открыт!*\n"
-                f"💰 Получено: +{db.format_number(reward)}£",
-                parse_mode="Markdown"
-            )
-        elif case_num == 3:
-            rewards = [1000, 2000, 5000, 10000]
-            reward = random.choice(rewards)
-            db.update_balance(user_id, reward)
-            await update.message.reply_text(
-                f"🎁 *{case['name']} кейс открыт!*\n"
-                f"💰 Получено: +{db.format_number(reward)}£\n"
-                f"🏆 +5 кубков",
-                parse_mode="Markdown"
-            )
-            db.update_race_stats(user_id, True, 5)
-        
-        new_user = db.get_user(user_id)
-        await update.message.reply_text(f"💰 Новый баланс: {db.format_number(new_user[1])}£")
-        
-    except:
-        await update.message.reply_text("❌ Использование: кейс 1, кейс 2 или кейс 3")
-
-# ============ ТОПЫ ============
-async def show_tops(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+            await query.answer("🎉 Максимальный уровень!", show_alert=True)
     
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 По деньгам", callback_data="top_balance"),
-         InlineKeyboardButton("⭐ По рейтингу", callback_data="top_rating")],
-        [InlineKeyboardButton("🏆 По гонкам", callback_data="top_race"),
-         InlineKeyboardButton("🔙 Назад", callback_data="back")]
-    ])
+    elif action == "upgrade_business":
+        level = user[2]
+        if level < 5:
+            cost = BUSINESSES[level]["upgrade_cost"]
+            if user[1] >= cost:
+                update_balance(user_id, -cost)
+                upgrade_business(user_id)
+                await query.answer("✅ Бизнес улучшен!", show_alert=True)
+                await query.edit_message_text("🎉 Поздравляю с апгрейдом!", 
+                                            reply_markup=get_main_keyboard())
+            else:
+                await query.answer(f"❌ Не хватает {cost - user[1]}💰", show_alert=True)
     
-    await query.edit_message_text(
-        "📊 *Выберите категорию топа:*",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
-
-async def top_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    top = db.get_top_balance(10)
-    text = "💰 *Топ богатейших игроков:*\n\n"
-    
-    for i, (name, balance, uid) in enumerate(top, 1):
-        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
-        text += f"{medal} {name} — {db.format_number(balance)}£\n"
-    
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_main_keyboard())
-
-async def top_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    top = db.get_top_rating(10)
-    text = "⭐ *Топ по рейтингу:*\n\n"
-    
-    for i, (name, rating, uid) in enumerate(top, 1):
-        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
-        text += f"{medal} {name} — {rating}⭐\n"
-    
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_main_keyboard())
-
-async def top_race(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    top = db.get_top_racers(10)
-    text = "🏆 *Топ гонщиков:*\n\n"
-    
-    for i, (name, cups, uid) in enumerate(top, 1):
-        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
-        text += f"{medal} {name} — {cups}🏆\n"
-    
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_main_keyboard())
-
-# ============ CALLBACK HANDLERS ============
-async def callback_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = db.get_user(query.from_user.id)
-    await query.edit_message_text(
-        f"💰 *Ваш баланс:* {db.format_number(user[1])}£\n"
-        f"💎 *CryptoCoin:* {db.format_number(user[2])}",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
-    )
-
-async def callback_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = db.get_user(query.from_user.id)
-    vip_bonus = VIP_PRICES.get(user[5], {"bonus": 1.0})["bonus"]
-    
-    await query.edit_message_text(
-        f"👤 *ПРОФИЛЬ #{user[0]}*\n\n"
-        f"📝 Ник: {user[3]}\n"
-        f"💰 Баланс: {db.format_number(user[1])}£\n"
-        f"💎 CryptoCoin: {db.format_number(user[2])}\n"
-        f"⭐ Рейтинг: {user[7]}\n"
-        f"👑 VIP: {VIP_PRICES.get(user[5], {'name': 'Нет'})['name']}\n"
-        f"🚗 Машина: {CARS.get(user[8], {'name': 'Нет'})['name']}\n"
-        f"🏆 Кубки: {user[9]}\n"
-        f"🏁 Гонок: {user[10]}\n"
-        f"🎉 Побед: {user[11]}",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
-    )
-
-async def callback_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "🎰 *КАЗИНО*\n\n"
-        "Используйте команду:\n"
-        "`казино <сумма>`\n\n"
-        "Примеры: `казино 1000` или `казино 1к`\n\n"
-        "Множители: x0, x0.25, x0.5, x0.75, x1, x1.5, x2, x3, x5, x10",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
-    )
-
-async def callback_race(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        f"🏁 *ГОНКИ*\n\n"
-        f"💰 Вступительный взнос: {db.format_number(RACE_ENTRY_FEE)}£\n"
-        f"🏆 Кубков за победу: от {RACE_BASE_CUPS}\n"
-        f"🎁 Награда: кейс + деньги\n\n"
-        f"Используйте команду: `гонка`",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
-    )
-
-async def callback_cases(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user = db.get_user(query.from_user.id)
-    user_cases = db.get_user_cases(query.from_user.id)
-    
-    text = "🎁 *ДОСТУПНЫЕ КЕЙСЫ*\n\n"
-    
-    for case_id, case in CASES.items():
-        if case["price"] > 0:
-            text += f"{case_id}. {case['name']} - {db.format_number(case['price'])}£\n"
+    elif action == "buy_manager":
+        if user[1] >= 2000:
+            conn = sqlite3.connect('business.db')
+            c = conn.cursor()
+            c.execute("UPDATE users SET balance = balance - 2000, manager = TRUE WHERE user_id = ?", (user_id,))
+            conn.commit()
+            conn.close()
+            await query.answer("✅ Менеджер нанят! +20% к доходу", show_alert=True)
+            # Обновляем сообщение
+            await query.edit_message_text("✅ Улучшение куплено!", reply_markup=get_main_keyboard())
         else:
-            user_case = next((c for c in user_cases if c[0] == case_id), None)
-            quantity = user_case[1] if user_case else 0
-            text += f"{case_id}. {case['name']} - {quantity} шт.\n"
+            await query.answer(f"❌ Не хватает {2000 - user[1]}💰", show_alert=True)
     
-    text += "\n💡 Используйте: `кейс 1`, `кейс 2` или `кейс 3`"
+    elif action == "buy_advertising":
+        if user[1] >= 1500:
+            conn = sqlite3.connect('business.db')
+            c = conn.cursor()
+            c.execute("UPDATE users SET balance = balance - 1500, advertising = TRUE WHERE user_id = ?", (user_id,))
+            conn.commit()
+            conn.close()
+            await query.answer("✅ Реклама запущена! +10% к доходу", show_alert=True)
+            await query.edit_message_text("✅ Улучшение куплено!", reply_markup=get_main_keyboard())
+        else:
+            await query.answer(f"❌ Не хватает {1500 - user[1]}💰", show_alert=True)
     
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_main_keyboard())
+    elif action == "tasks":
+        text = ("📋 *Ежедневное задание*\n\n"
+                "✅ Собрать доход 3 раза\n\n"
+                "🏆 Награда: 500 монет")
+        keyboard = [[InlineKeyboardButton("💰 Забрать награду", callback_data="claim_reward")],
+                   [InlineKeyboardButton("🔙 Назад", callback_data="back")]]
+        await query.edit_message_text(text, parse_mode='Markdown', 
+                                    reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif action == "claim_reward":
+        update_balance(user_id, 500)
+        await query.answer("🎉 +500 монет!", show_alert=True)
+        await query.edit_message_text("✅ Награда получена!", reply_markup=get_main_keyboard())
+    
+    elif action == "stats":
+        level = user[2]
+        income = calculate_income(user)
+        text = (f"📊 *Статистика*\n\n"
+                f"💰 Баланс: {user[1]}\n"
+                f"🏪 Бизнес: {BUSINESSES[level]['name']}\n"
+                f"📈 Уровень: {level}/5\n"
+                f"💵 Доход: {income}\n"
+                f"💹 Всего: {user[4]}\n"
+                f"👔 Менеджер: {'✅' if user[5] else '❌'}\n"
+                f"📢 Реклама: {'✅' if user[6] else '❌'}")
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=get_main_keyboard())
+    
+    elif action == "back":
+        await query.edit_message_text("🏪 *Главное меню*\nВыберите действие:", 
+                                    parse_mode='Markdown', 
+                                    reply_markup=get_main_keyboard())
 
-async def callback_vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    text = "👑 *VIP СТАТУСЫ*\n\n"
-    for level, vip in VIP_PRICES.items():
-        if level > 0:
-            text += f"{vip['name']} - {db.format_number(vip['price'])}£\n"
-            text += f"└ Бонус: x{vip['bonus']} к доходу\n\n"
-    
-    text += "💡 Для покупки: `/buy_vip <уровень>`\n"
-    text += "Пример: `/buy_vip бронза`"
-    
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_main_keyboard())
-
-async def callback_business(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    text = "🏪 *БИЗНЕСЫ*\n\n"
-    for biz_id, biz in BUSINESSES.items():
-        text += f"{biz['name']}\n"
-        text += f"└ Доход: {db.format_number(biz['income'])}£\n"
-        text += f"└ Цена: {db.format_number(biz['price'])}£\n\n"
-    
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_main_keyboard())
-
-async def callback_cars(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user = db.get_user(query.from_user.id)
-    
-    text = "🚗 *МАШИНЫ ДЛЯ ГОНОК*\n\n"
-    for car_id, car in CARS.items():
-        check = "✅" if user[8] == car_id else "❌"
-        text += f"{check} {car['name']}\n"
-        text += f"└ Сила: {car['power']} | Цена: {db.format_number(car['price'])}£\n\n"
-    
-    text += "💡 Для покупки: `/buy_car <номер>`\nПример: `/buy_car 3`"
-    
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_main_keyboard())
-
-async def callback_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    await query.edit_message_text(
-        "📋 *СИСТЕМА РЕПОРТОВ*\n\n"
-        "Для жалобы на игрока используйте:\n"
-        "`/report <ID> <причина>`\n\n"
-        "Пример: `/report 15 Оскорбления в чате`",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
-    )
-
-async def callback_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user = db.get_user(query.from_user.id)
-    await query.edit_message_text(
-        f"🏦 *CRYPTO EMPIRE* 🏦\n\n"
-        f"👋 Привет, {user[3]}!\n"
-        f"💰 Баланс: {db.format_number(user[1])}£\n"
-        f"⭐ Рейтинг: {user[7]}\n\n"
-        f"Используйте кнопки для навигации!",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
-    )
-
-# ============ АДМИН КОМАНДЫ ============
-async def give_case(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if user_id != DEVELOPER_ID:
-        await update.message.reply_text("❌ Нет прав!")
-        return
-    
-    try:
-        target_id = int(context.args[0])
-        case_id = int(context.args[1])
-        quantity = int(context.args[2]) if len(context.args) > 2 else 1
-        
-        db.add_case(target_id, case_id, quantity)
-        await update.message.reply_text(f"✅ Выдал {quantity} кейс(ов) #{case_id} игроку #{target_id}")
-    except:
-        await update.message.reply_text("❌ Использование: /give_case <ID> <кейс> <кол-во>")
-
-async def give_money(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if user_id != DEVELOPER_ID:
-        await update.message.reply_text("❌ Нет прав!")
-        return
-    
-    try:
-        target_id = int(context.args[0])
-        amount = int(context.args[1])
-        
-        db.update_balance(target_id, amount)
-        await update.message.reply_text(f"✅ Выдал {db.format_number(amount)}£ игроку #{target_id}")
-    except:
-        await update.message.reply_text("❌ Использование: /give_money <ID> <сумма>")
-
-async def give_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if user_id != DEVELOPER_ID:
-        await update.message.reply_text("❌ Нет прав!")
-        return
-    
-    try:
-        target_id = int(context.args[0])
-        amount = int(context.args[1])
-        
-        db.update_rating(target_id, amount)
-        await update.message.reply_text(f"✅ Выдал {amount}⭐ рейтинга игроку #{target_id}")
-    except:
-        await update.message.reply_text("❌ Использование: /give_rating <ID> <количество>")
-
-# ============ ЗАПУСК ============
 def main():
-    print("🤖 Бот CRYPTO EMPIRE запущен!")
-    print(f"👑 Разработчик: {DEVELOPER_ID}")
-    print("📋 Доступные команды:")
-    print("   - баланс, профиль, казино 1000, гонка, кейс 1")
-    print("   - /start - перезапуск")
-    print("   - /give_case - админ")
-    print("   - /give_money - админ")
-    print("   - /give_rating - админ")
+    init_db()
+    app = Application.builder().token(TOKEN).build()
     
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("give_case", give_case))
-    app.add_handler(CommandHandler("give_money", give_money))
-    app.add_handler(CommandHandler("give_rating", give_rating))
+    app.add_handler(CallbackQueryHandler(button_callback))
     
-    # Callback handlers
-    app.add_handler(CallbackQueryHandler(callback_balance, pattern="balance"))
-    app.add_handler(CallbackQueryHandler(callback_profile, pattern="profile"))
-    app.add_handler(CallbackQueryHandler(callback_casino, pattern="casino"))
-    app.add_handler(CallbackQueryHandler(callback_race, pattern="race"))
-    app.add_handler(CallbackQueryHandler(callback_cases, pattern="cases"))
-    app.add_handler(CallbackQueryHandler(callback_vip, pattern="vip"))
-    app.add_handler(CallbackQueryHandler(callback_business, pattern="business"))
-    app.add_handler(CallbackQueryHandler(show_tops, pattern="tops"))
-    app.add_handler(CallbackQueryHandler(callback_cars, pattern="cars"))
-    app.add_handler(CallbackQueryHandler(callback_report, pattern="report"))
-    app.add_handler(CallbackQueryHandler(callback_back, pattern="back"))
-    app.add_handler(CallbackQueryHandler(top_balance, pattern="top_balance"))
-    app.add_handler(CallbackQueryHandler(top_rating, pattern="top_rating"))
-    app.add_handler(CallbackQueryHandler(top_race, pattern="top_race"))
-    
-    # Текстовые сообщения
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("🤖 Бот успешно запущен!")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
